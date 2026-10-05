@@ -4,6 +4,6 @@
   "private": true,
   "description": "A private app launcher with memorable Tailscale shortcuts",
   "type": "module",
-  "engines": { "node": ">=24" },
+  "engines": { "node": ">=24.21.0 <25" },
   "scripts": { "start": "node server.mjs", "test": "node --test" }
 }

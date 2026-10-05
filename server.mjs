@@ -2,9 +2,9 @@ import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { once } from 'node:events';
 
 const root = path.dirname(fileURLToPath(import.meta.url));
-const stylesheet = fs.readFileSync(path.join(root, 'public/style.css'));
 const maxConfigBytes = 128 * 1024;
 const maxApps = 500;
 const slugPattern = /^[a-zA-Z0-9_-]{1,80}$/;
@@ -108,6 +108,7 @@ function home(entries) {
 }
 
 export function createServer({ configPath = path.join(root, 'apps.json'), reloadMs = 1000, onConfigError = () => console.error('Shortcut configuration unavailable; check the local configuration.') } = {}) {
+  const stylesheet = fs.readFileSync(path.join(root, 'public/style.css'));
   let config = loadConfig(configPath);
   let checkedAt = performance.now();
   let hadError = false;
@@ -172,13 +173,23 @@ export function createServer({ configPath = path.join(root, 'apps.json'), reload
   return server;
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
+async function start() {
   const port = Number(process.env.PORT || 8790);
   if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('Invalid PORT');
   const server = createServer({ configPath: process.env.MINI_CONFIG || path.join(root, 'apps.json') });
-  server.listen(port, '127.0.0.1', () => console.log(`Mini shortcuts listening on 127.0.0.1:${port}`));
+  server.listen(port, '127.0.0.1');
+  await once(server, 'listening');
+  console.log(`Mini shortcuts listening on 127.0.0.1:${port}`);
   for (const signal of ['SIGTERM', 'SIGINT']) process.once(signal, () => {
     server.close(() => process.exit(0));
     setTimeout(() => { server.closeAllConnections(); process.exit(0); }, 5000).unref();
+  });
+}
+
+if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
+  start().catch(() => {
+    // Parser and filesystem errors can contain private configuration or paths.
+    console.error('Mini shortcuts could not start; check the local configuration, files, and port.');
+    process.exitCode = 1;
   });
 }

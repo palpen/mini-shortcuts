@@ -6,6 +6,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { once } from 'node:events';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { createServer, loadConfig } from '../server.mjs';
 
 const base = () => ({
@@ -185,4 +187,44 @@ test('configuration cache avoids filesystem reads on every request', async t => 
   const { request, configPath } = await running(t, base(), { reloadMs: 60000 });
   fs.writeFileSync(configPath, 'invalid');
   assert.equal((await request()).status, 200);
+});
+
+test('startup failures exit unsuccessfully without logging private values or paths', t => {
+  const { dir, configPath, write } = fixture(t);
+  const script = fileURLToPath(new URL('../server.mjs', import.meta.url));
+  const diagnostic = 'Mini shortcuts could not start; check the local configuration, files, and port.\n';
+  const run = (env = {}, entry = script) => {
+    const result = spawnSync(process.execPath, [fs.realpathSync(entry)], {
+      env: { ...process.env, MINI_CONFIG: configPath, PORT: '8790', ...env },
+      encoding: 'utf8', timeout: 5000,
+    });
+    assert.ifError(result.error);
+    assert.equal(result.status, 1);
+    assert.equal(result.stdout, '');
+    assert.equal(result.stderr, diagnostic);
+  };
+  fs.writeFileSync(configPath, '{"secret":"FAKE_PRIVATE_VALUE", broken');
+  run();
+  const config = base();
+  config.apps[0].url = 'https://[invalid]/?token=FAKE_PRIVATE_VALUE';
+  write(config);
+  run();
+  run({ MINI_CONFIG: path.join(dir, 'private-missing-config.json') });
+  run({ PORT: 'invalid' });
+  // Missing startup assets must not leak their absolute filesystem paths either.
+  const isolatedScript = path.join(dir, 'server.mjs');
+  fs.copyFileSync(script, isolatedScript);
+  run({}, isolatedScript);
+});
+
+test('a port conflict produces a sanitized startup failure', async t => {
+  const { server, configPath } = await running(t);
+  const result = spawnSync(process.execPath, [fileURLToPath(new URL('../server.mjs', import.meta.url))], {
+    env: { ...process.env, MINI_CONFIG: configPath, PORT: String(server.address().port) },
+    encoding: 'utf8', timeout: 5000,
+  });
+  assert.ifError(result.error);
+  assert.equal(result.status, 1);
+  assert.equal(result.stdout, '');
+  assert.equal(result.stderr, 'Mini shortcuts could not start; check the local configuration, files, and port.\n');
 });

@@ -31,6 +31,7 @@ Regression tests cover HTML escaping, security headers, unknown/duplicate Host v
 - Updates can take up to the one-second cache interval to become visible. A broken or missing config/discovery directory makes the launcher unavailable until repaired.
 - Host validation does not authenticate local processes. The host machine, Tailscale Serve, its access policy, and its administrators are trusted.
 - Use a maintained Node release. There are no npm dependencies to audit, but Node and the operating system remain dependencies.
+- Startup failures emit a generic message and exit unsuccessfully; raw parser errors, configuration values, and filesystem paths are not logged. Configuration reload failures also use a generic message.
 - Publication hygiene checks use known-identifier and credential patterns plus manual review. Such scans cannot prove absence of every possible secret.
 
 ## Reporting

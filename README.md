@@ -2,9 +2,11 @@
 
 A small, self-hosted app directory for a Tailscale network. Open `http://mini/` to see your apps, or type `http://mini/pigeon` to jump to an app's HTTPS address. The address bar changes to the destination URL.
 
-Runs on Node.js 24 or later with no third-party dependencies. Includes optional discovery of sites published with Tailnow. No domain purchase, custom DNS server, or client certificate installation is needed.
+Runs on maintained Node.js 24 LTS (24.21.0 or newer 24.x) with no third-party dependencies. Keep the runtime updated with security releases. Includes optional discovery of sites published with Tailnow. No domain purchase, custom DNS server, or client certificate installation is needed.
 
 ## Run locally
+
+Use the latest Node 24 LTS patch. With nvm, run `nvm install` and `nvm use` in this directory; `.nvmrc` selects the 24.x line.
 
 ```sh
 cp apps.example.json apps.json
@@ -62,6 +64,8 @@ See [Tailscale Serve](https://tailscale.com/docs/features/tailscale-serve) and [
 ## Start at login on macOS
 
 Copy `deploy/com.example.mini-shortcuts.plist.example` to `~/Library/LaunchAgents/com.example.mini-shortcuts.plist`. Replace the absolute application, Node executable, and log paths. Keep the service in a stable directory; `server.mjs`, `public/style.css`, and your private `apps.json` must stay together. Create the log directory before loading the agent.
+
+On Apple Silicon Macs using Homebrew, install `node@24` and use `/opt/homebrew/opt/node@24/bin/node` as the agent's executable. This selects Node 24 specifically for the service. Update it periodically with `brew upgrade node@24` and restart the agent to load the updated runtime.
 
 ```sh
 launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/com.example.mini-shortcuts.plist
