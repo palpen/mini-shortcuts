@@ -1,0 +1,6 @@
+{
+  "allowedHosts": ["localhost:8790", "127.0.0.1:8790", "mini", "mini.example-tailnet.ts.net"],
+  "apps": [
+    {"slug": "pigeon", "name": "Pigeon", "description": "Files, notes, and reports", "url": "https://mini.example-tailnet.ts.net:8443/"}
+  ]
+}

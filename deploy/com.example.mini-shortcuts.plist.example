@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.example.mini-shortcuts</string>
+  <key>ProgramArguments</key>
+  <array><string>/absolute/path/to/node</string><string>/absolute/path/to/mini-shortcuts/server.mjs</string></array>
+  <key>WorkingDirectory</key><string>/absolute/path/to/mini-shortcuts</string>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>/absolute/path/to/logs/mini-shortcuts.log</string>
+  <key>StandardErrorPath</key><string>/absolute/path/to/logs/mini-shortcuts-error.log</string>
+</dict>
+</plist>

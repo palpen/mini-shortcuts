@@ -1,0 +1,19 @@
+# Private runtime configuration and deployment state
+apps.json
+apps.*.json
+!apps.example.json
+*.local.json
+.env
+.env.*
+!.env.example
+backups/
+logs/
+data/
+*.log
+*.plist
+!*.plist.example
+node_modules/
+coverage/
+.DS_Store
+*.pem
+*.key
