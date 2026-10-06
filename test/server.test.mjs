@@ -8,7 +8,7 @@ import path from 'node:path';
 import { once } from 'node:events';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { createServer, loadConfig } from '../server.mjs';
+import { createServer, loadConfig, stopApp } from '../server.mjs';
 
 const base = () => ({
   allowedHosts: ['mini', '127.0.0.1:8790'],
@@ -227,4 +227,208 @@ test('a port conflict produces a sanitized startup failure', async t => {
   assert.equal(result.status, 1);
   assert.equal(result.stdout, '');
   assert.equal(result.stderr, 'Mini shortcuts could not start; check the local configuration, files, and port.\n');
+});
+
+const manage = (request, slug, action, headers = {}) => request(`/api/apps/${slug}/${action}`, { 'X-Mini-Request': '1', ...headers }, 'POST');
+
+test('minimize and restore persist across restarts without stopping apps or breaking shortcuts', async t => {
+  let stops = 0;
+  const { request, configPath } = await running(t, base(), { shutdown: async () => { stops++; } });
+  assert.equal((await manage(request, 'pigeon', 'minimize')).status, 200);
+  let home = (await request()).body;
+  assert.match(home, /id="minimized"/);
+  assert.ok(home.indexOf('id="minimized"') < home.indexOf('href="/pigeon"'));
+  assert.equal((await request('/pigeon')).status, 302);
+  const restarted = await running(t, base(), { configPath });
+  assert.match((await restarted.request()).body, /id="minimized"/);
+  assert.equal((await manage(request, 'pigeon', 'restore')).status, 200);
+  home = (await request()).body;
+  assert.ok(!home.includes('id="minimized"'));
+  assert.equal(stops, 0);
+  assert.deepEqual(JSON.parse(fs.readFileSync(configPath, 'utf8')), base());
+});
+
+test('remove only hides the shortcut, supports restore, and never stops the service', async t => {
+  let stops = 0;
+  const config = base();
+  config.apps[0].service = { type: 'launchAgent', label: 'com.example.pigeon' };
+  const { request, configPath } = await running(t, config, { shutdown: async () => { stops++; } });
+  assert.equal((await manage(request, 'pigeon', 'remove')).status, 200);
+  assert.equal((await request('/pigeon')).status, 404);
+  assert.match((await request()).body, /Removed from this directory only/);
+  const restarted = await running(t, config, { configPath });
+  assert.equal((await restarted.request('/pigeon')).status, 404);
+  assert.equal((await manage(request, 'pigeon', 'restore')).status, 200);
+  assert.equal((await request('/pigeon')).status, 302);
+  assert.equal(stops, 0);
+});
+
+test('management rejects cross-site requests, missing custom headers, bodies, and unknown actions', async t => {
+  let stops = 0;
+  const { request, dir } = await running(t, base(), { shutdown: async () => { stops++; } });
+  const route = '/api/apps/pigeon/remove';
+  assert.equal((await request(route, {}, 'POST')).status, 403);
+  assert.equal((await manage(request, 'pigeon', 'remove', { Origin: 'https://attacker.example' })).status, 403);
+  assert.equal((await manage(request, 'pigeon', 'remove', { 'Sec-Fetch-Site': 'cross-site', 'Sec-Fetch-Mode': 'navigate' })).status, 403);
+  assert.equal((await manage(request, 'pigeon', 'remove', { Host: 'attacker.example' })).status, 403);
+  assert.equal((await request(route, {}, 'OPTIONS')).status, 405);
+  assert.equal((await request(route)).status, 404);
+  assert.equal((await request(route, {}, 'HEAD')).status, 404);
+  assert.equal((await manage(request, 'missing', 'remove')).status, 404);
+  assert.equal((await manage(request, 'pigeon', 'execute')).status, 405);
+  assert.equal((await manage(request, '..', 'remove')).status, 405);
+  assert.equal((await manage(request, 'pigeon', 'remove?label=com.other.app')).status, 405);
+  assert.equal((await manage(request, 'pigeon', 'remove', { 'Content-Length': '1' })).status, 400);
+  assert.equal((await manage(request, 'pigeon', 'shutdown')).status, 409);
+  assert.equal((await request('/pigeon')).status, 302);
+  assert.ok(!fs.existsSync(path.join(dir, 'apps.state.json')));
+  assert.equal(stops, 0);
+});
+
+test('shutdown removes first, uses only the configured target, and saves confirmed status', async t => {
+  const config = base();
+  config.apps[0].service = { type: 'launchAgent', label: 'com.example.pigeon' };
+  let target;
+  const { request, dir } = await running(t, config, { shutdown: async app => {
+    target = app.shutdown;
+    assert.equal(JSON.parse(fs.readFileSync(path.join(dir, 'apps.state.json'))).apps.pigeon.shutdown, 'pending');
+    assert.equal((await request('/pigeon')).status, 404);
+  } });
+  assert.equal((await manage(request, 'pigeon', 'shutdown', { 'X-Service': 'com.unrelated.app' })).status, 200);
+  assert.deepEqual(target, { type: 'launchAgent', label: 'com.example.pigeon' });
+  assert.equal(JSON.parse(fs.readFileSync(path.join(dir, 'apps.state.json'))).apps.pigeon.shutdown, 'stopped');
+  assert.match((await request()).body, /Shut down<\/span>/);
+  assert.equal((await manage(request, 'pigeon', 'restore')).status, 409);
+  assert.equal(fs.statSync(path.join(dir, 'apps.state.json')).mode & 0o777, 0o600);
+});
+
+test('shutdown failures remain removed, sanitize errors, and allow a later retry', async t => {
+  const config = base();
+  config.apps[0].service = { type: 'launchAgent', label: 'com.example.pigeon' };
+  let attempts = 0;
+  const { request, configPath } = await running(t, config, { shutdown: async () => {
+    if (++attempts === 1) throw new Error('/private/service/path: secret');
+  } });
+  const failure = await manage(request, 'pigeon', 'shutdown');
+  assert.equal(failure.status, 502);
+  assert.ok(!failure.body.includes('secret'));
+  assert.equal((await request('/pigeon')).status, 404);
+  assert.match((await request()).body, /Shutdown failed/);
+  const restarted = await running(t, config, { configPath });
+  assert.match((await restarted.request()).body, /Shutdown failed/);
+  assert.equal((await manage(request, 'pigeon', 'shutdown')).status, 200);
+  assert.equal(attempts, 2);
+});
+
+test('failure to save removal never stops an app', async t => {
+  const config = base();
+  config.apps[0].service = { type: 'launchAgent', label: 'com.example.pigeon' };
+  let stops = 0;
+  const { request, dir } = await running(t, config, { shutdown: async () => { stops++; } });
+  fs.mkdirSync(path.join(dir, 'apps.state.json'));
+  assert.equal((await manage(request, 'pigeon', 'shutdown')).status, 503);
+  assert.equal(stops, 0);
+  assert.equal((await request('/pigeon')).status, 302);
+  assert.ok(!fs.readdirSync(dir).some(name => name.endsWith('.tmp')));
+});
+
+test('simultaneous changes are rejected while a shutdown is in progress', async t => {
+  const config = base();
+  config.apps[0].service = { type: 'launchAgent', label: 'com.example.pigeon' };
+  let release, started;
+  const began = new Promise(resolve => { started = resolve; });
+  const gate = new Promise(resolve => { release = resolve; });
+  const { request } = await running(t, config, { shutdown: async () => { started(); await gate; } });
+  const first = manage(request, 'pigeon', 'shutdown');
+  await began;
+  try {
+    assert.equal((await manage(request, 'pigeon', 'restore')).status, 409);
+    assert.equal((await manage(request, 'pigeon', 'shutdown')).status, 409);
+  } finally { release(); }
+  assert.equal((await first).status, 200);
+});
+
+test('Tailnow shutdown archives only the selected site and removed discoveries stay hidden', async t => {
+  const { request, dir, write, configPath } = await running(t, base(), { reloadMs: 0 });
+  const sites = path.join(dir, 'sites');
+  fs.mkdirSync(sites);
+  for (const slug of ['weather', 'notes']) {
+    fs.mkdirSync(path.join(sites, slug));
+    fs.writeFileSync(path.join(sites, slug, 'index.html'), slug);
+  }
+  write({ ...base(), tailnow: { directory: sites, url: 'https://published.example/' } });
+  assert.equal((await manage(request, 'weather', 'remove')).status, 200);
+  assert.equal((await request('/weather')).status, 404);
+  assert.ok(fs.existsSync(path.join(sites, 'weather/index.html')));
+  assert.equal((await manage(request, 'weather', 'shutdown')).status, 200);
+  assert.ok(!fs.existsSync(path.join(sites, 'weather')));
+  assert.equal(fs.readFileSync(path.join(sites, 'notes/index.html'), 'utf8'), 'notes');
+  const archive = `${sites}.mini-shortcuts-archive`;
+  const [archived] = fs.readdirSync(archive);
+  assert.equal(fs.readFileSync(path.join(archive, archived, 'index.html'), 'utf8'), 'weather');
+  assert.equal((await request('/notes')).status, 302);
+  assert.match((await request()).body, /Shut down<\/span>/);
+  const restarted = await running(t, base(), { configPath });
+  assert.equal((await restarted.request('/weather')).status, 404);
+  assert.match((await restarted.request()).body, /Shut down<\/span>/);
+});
+
+test('Tailnow shutdown refuses replaced site and archive symlinks', async t => {
+  const { dir } = fixture(t);
+  const sites = path.join(dir, 'sites');
+  const outside = path.join(dir, 'outside');
+  fs.mkdirSync(sites); fs.mkdirSync(outside);
+  const app = { shutdown: { type: 'tailnow', directory: sites, slug: 'weather' } };
+  fs.symlinkSync(outside, path.join(sites, 'weather'));
+  await assert.rejects(stopApp(app));
+  fs.unlinkSync(path.join(sites, 'weather'));
+  fs.mkdirSync(path.join(sites, 'weather'));
+  fs.symlinkSync(outside, `${sites}.mini-shortcuts-archive`);
+  await assert.rejects(stopApp(app));
+  assert.ok(fs.existsSync(path.join(sites, 'weather')));
+  assert.deepEqual(fs.readdirSync(outside), []);
+});
+
+test('LaunchAgent shutdown disables automatic restart, unloads, and verifies absence without a shell', async () => {
+  const calls = [];
+  const app = { shutdown: { type: 'launchAgent', label: 'com.example.pigeon' } };
+  const run = async (file, args, options) => {
+    calls.push(args);
+    assert.equal(file, '/bin/launchctl');
+    assert.equal(options.shell, undefined);
+    assert.equal(options.timeout, 3000);
+    if (args[0] === 'print') throw Object.assign(new Error('missing'), { code: 113, stderr: 'Could not find service "com.example.pigeon"' });
+  };
+  await stopApp(app, { run, platform: 'darwin', uid: 501 });
+  assert.deepEqual(calls, ['disable', 'bootout', 'print'].map(action => [action, 'gui/501/com.example.pigeon']));
+  await assert.rejects(stopApp(app, { run: async () => ({}), platform: 'darwin', uid: 501 }), /still loaded/);
+  await assert.rejects(stopApp(app, { run: async () => { throw new Error('denied'); }, platform: 'darwin', uid: 501 }));
+  await assert.rejects(stopApp(app, { run, platform: 'linux', uid: 501 }));
+});
+
+test('configuration rejects unsafe service mappings and broken persistent state', t => {
+  const { configPath, write, dir } = fixture(t);
+  for (const service of [null, { type: 'shell', label: 'foo' }, { type: 'launchAgent', label: '../foo' },
+    { type: 'launchAgent', label: 'foo;reboot' }, { type: 'launchAgent', label: '-x' }]) {
+    write({ ...base(), apps: [{ ...base().apps[0], service }] });
+    assert.throws(() => loadConfig(configPath));
+  }
+  write(base());
+  for (const state of ['secret-invalid-json', '{"version":1,"apps":[]}', '{"version":1,"apps":{"bad/path":{}}}']) {
+    fs.writeFileSync(path.join(dir, 'apps.state.json'), state);
+    assert.throws(() => createServer({ configPath }));
+  }
+});
+
+test('special property names are safe app slugs and state never leaks through HTTP', async t => {
+  const config = base();
+  config.apps[0].slug = '__proto__';
+  const { request } = await running(t, config);
+  assert.equal((await manage(request, '__proto__', 'minimize')).status, 200);
+  assert.equal((await request('/__proto__')).status, 302);
+  assert.match((await request()).body, /id="minimized"/);
+  assert.equal((await manage(request, '__proto__', 'remove')).status, 200);
+  assert.equal((await request('/__proto__')).status, 404);
+  assert.equal((await request('/apps.state.json')).status, 404);
+  assert.equal((await request('/app.js')).headers['content-type'], 'text/javascript; charset=utf-8');
 });

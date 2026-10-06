@@ -3,6 +3,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { once } from 'node:events';
+import { randomUUID } from 'node:crypto';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 
 const root = path.dirname(fileURLToPath(import.meta.url));
 const maxConfigBytes = 128 * 1024;
@@ -38,7 +41,7 @@ function text(value, maxLength) {
   return value;
 }
 
-export function loadConfig(configPath) {
+function readJson(configPath) {
   // Read at most the configured limit, including if the file grows during the read.
   const fd = fs.openSync(configPath, 'r');
   let raw;
@@ -56,7 +59,11 @@ export function loadConfig(configPath) {
   } finally {
     fs.closeSync(fd);
   }
-  const config = JSON.parse(raw);
+  return JSON.parse(raw);
+}
+
+export function loadConfig(configPath) {
+  const config = readJson(configPath);
   if (!config || !Array.isArray(config.allowedHosts) || !config.allowedHosts.length ||
       config.allowedHosts.length > 32 || !Array.isArray(config.apps) || config.apps.length > maxApps) {
     throw new Error('Configure allowedHosts and an apps array');
@@ -67,10 +74,19 @@ export function loadConfig(configPath) {
     if (!item || typeof item.slug !== 'string' || !slugPattern.test(item.slug) || entries.has(item.slug)) {
       throw new Error('Invalid or duplicate app slug');
     }
+    let shutdown;
+    if (item.service !== undefined) {
+      if (!item.service || item.service.type !== 'launchAgent' ||
+          typeof item.service.label !== 'string' || !/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,199}$/.test(item.service.label)) {
+        throw new Error('Invalid app service');
+      }
+      shutdown = { type: 'launchAgent', label: item.service.label };
+    }
     entries.set(item.slug, {
       slug: item.slug, name: text(item.name, 120),
       description: item.description === undefined || item.description === '' ? '' : text(item.description, 300),
       url: httpsUrl(item.url).href,
+      shutdown,
     });
   }
   if (config.tailnow !== undefined) {
@@ -93,6 +109,7 @@ export function loadConfig(configPath) {
         entries.set(item.name, {
           slug: item.name, name: item.name.replaceAll('-', ' '),
           description: 'Published with Tailnow', url: new URL(`${item.name}/`, base).href,
+          shutdown: { type: 'tailnow', directory: path.resolve(settings.directory), slug: item.name },
         });
       }
     } finally {
@@ -102,17 +119,95 @@ export function loadConfig(configPath) {
   return { allowedHosts, entries };
 }
 
-function home(entries) {
-  const cards = [...entries.values()].map(app => `<a href="/${escape(app.slug)}"><strong>${escape(app.name)}</strong><span>${escape(app.description)}</span><code>/${escape(app.slug)} →</code></a>`).join('');
-  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Mini · Your apps</title><link rel="stylesheet" href="/style.css"></head><body><main><small>Mac Mini · Private apps</small><h1>A little home<br>for your apps.</h1><p>Choose an app, or add <b>/app-name</b> to this address on a device connected to your Tailscale network.</p><div class="apps">${cards}</div><footer>Short names lead to each app’s secure HTTPS address.</footer></main></body></html>`;
+function loadState(statePath) {
+  let state;
+  try { state = readJson(statePath); } catch (error) {
+    if (error.code === 'ENOENT') return {};
+    throw error;
+  }
+  if (!state || state.version !== 1 || !state.apps || typeof state.apps !== 'object' || Array.isArray(state.apps) || Object.keys(state.apps).length > 2000) {
+    throw new Error('Invalid directory state');
+  }
+  for (const [slug, entry] of Object.entries(state.apps)) {
+    if (!slugPattern.test(slug) || !entry || !['minimized', 'removed'].includes(entry.visibility) ||
+        !['none', 'pending', 'stopped', 'failed'].includes(entry.shutdown)) throw new Error('Invalid directory state');
+    text(entry.name, 120);
+  }
+  return state.apps;
 }
 
-export function createServer({ configPath = path.join(root, 'apps.json'), reloadMs = 1000, onConfigError = () => console.error('Shortcut configuration unavailable; check the local configuration.') } = {}) {
+function saveState(statePath, apps) {
+  const data = JSON.stringify({ version: 1, apps }, null, 2) + '\n';
+  if (Buffer.byteLength(data) > maxConfigBytes || Object.keys(apps).length > 2000) throw new Error('Directory state is too large');
+  const temporary = `${statePath}.${randomUUID()}.tmp`;
+  try {
+    fs.writeFileSync(temporary, data, { mode: 0o600, flag: 'wx' });
+    fs.renameSync(temporary, statePath);
+  } finally {
+    if (fs.existsSync(temporary)) fs.unlinkSync(temporary);
+  }
+}
+
+// Targets come exclusively from trusted local configuration, never HTTP input.
+export async function stopApp(app, { run = promisify(execFile), platform = process.platform, uid = process.getuid?.() } = {}) {
+  const target = app.shutdown;
+  if (target?.type === 'tailnow') {
+    const source = path.join(target.directory, target.slug);
+    if (!fs.lstatSync(source).isDirectory()) throw new Error('Site is not a directory');
+    // A sibling outside the served root keeps the site's files recoverable.
+    const archive = `${target.directory}.mini-shortcuts-archive`;
+    fs.mkdirSync(archive, { recursive: true, mode: 0o700 });
+    if (!fs.lstatSync(archive).isDirectory()) throw new Error('Invalid archive directory');
+    fs.renameSync(source, path.join(archive, `${target.slug}-${randomUUID()}`));
+    return;
+  }
+  if (target?.type !== 'launchAgent' || platform !== 'darwin' || !Number.isInteger(uid)) throw new Error('Shutdown is unavailable');
+  const service = `gui/${uid}/${target.label}`;
+  const invoke = args => run('/bin/launchctl', args, { timeout: 3000, maxBuffer: 64 * 1024, encoding: 'utf8' });
+  // Persistently disable before unloading so KeepAlive/login cannot restart it.
+  await invoke(['disable', service]);
+  try { await invoke(['bootout', service]); } catch { /* Verify unloaded state below, including already stopped jobs. */ }
+  try {
+    await invoke(['print', service]);
+  } catch (error) {
+    if (error.code === 113 && /Could not find service/.test(error.stderr || '')) return;
+    throw new Error('Could not verify shutdown');
+  }
+  throw new Error('Service is still loaded');
+}
+
+function home(entries, state) {
+  const button = (slug, action, label, extra = '') => `<button type="button" data-slug="${escape(slug)}" data-action="${action}" ${extra}>${label}</button>`;
+  const featured = [], minimized = [], removed = [];
+  for (const app of entries.values()) {
+    const status = Object.hasOwn(state, app.slug) ? state[app.slug] : undefined;
+    if (status?.visibility === 'removed') continue;
+    const isMinimized = status?.visibility === 'minimized';
+    const controls = button(app.slug, isMinimized ? 'restore' : 'minimize', isMinimized ? 'Restore' : 'Minimize') +
+      button(app.slug, 'confirm-remove', 'Remove…', `data-name="${escape(app.name)}" data-shutdown="${app.shutdown?.type || ''}"`);
+    const card = `<article class="app${isMinimized ? ' compact' : ''}"><a href="/${escape(app.slug)}"><strong>${escape(app.name)}</strong><span>${escape(app.description)}</span><code>/${escape(app.slug)} →</code></a><div class="controls">${controls}</div></article>`;
+    (isMinimized ? minimized : featured).push(card);
+  }
+  for (const [slug, status] of Object.entries(state)) {
+    if (status.visibility !== 'removed') continue;
+    const app = entries.get(slug);
+    const label = { none: 'Removed from this directory only', pending: app?.shutdown ? 'Shutdown needs verification — retry to confirm' : 'Shutdown needs verification on the server', stopped: 'Shut down', failed: app?.shutdown ? 'Shutdown failed — you can retry' : 'Shutdown needs attention on the server' }[status.shutdown];
+    const controls = (app && status.shutdown === 'none' ? button(slug, 'restore', 'Restore') : '') +
+      (app?.shutdown && status.shutdown !== 'stopped' ? button(slug, 'confirm-stop', 'Shut down…', `data-name="${escape(status.name)}" data-shutdown="${app.shutdown.type}"`) : '');
+    removed.push(`<article class="removed-app"><div><strong>${escape(status.name)}</strong><span>${label}</span></div><div class="controls">${controls}</div></article>`);
+  }
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Mini · Your apps</title><link rel="stylesheet" href="/style.css"><script src="/app.js" defer></script></head><body><main><small>Mac Mini · Private apps</small><h1>A little home<br>for your apps.</h1><p>Your everyday apps up front. Minimize the rest to keep them handy and running.</p><p id="notice" role="status" aria-live="polite"></p><section aria-labelledby="featured-title"><h2 id="featured-title">Your apps <span class="count">${featured.length}</span></h2><div class="apps">${featured.join('') || '<p class="empty">No apps up front. Restore a minimized app to bring it here.</p>'}</div></section>${minimized.length ? `<details id="minimized"><summary>Minimized <span class="count">${minimized.length}</span><span class="hint">Still available</span></summary><div class="apps minimized">${minimized.join('')}</div></details>` : ''}${removed.length ? `<details id="removed"><summary>Removed <span class="count">${removed.length}</span></summary><div class="removed-list">${removed.join('')}</div><p class="hint">Shut-down apps need to be restarted or republished on the server before use.</p></details>` : ''}<footer>Minimizing keeps each app available at its usual address. Your layout is saved across devices.</footer></main><dialog id="remove-dialog" aria-labelledby="dialog-title" aria-describedby="dialog-description"><form method="dialog"><h2 id="dialog-title">Remove app?</h2><p id="dialog-description"></p><label id="shutdown-option"><input type="checkbox" id="shutdown-checkbox"> Also shut down on the server</label><p id="shutdown-help" class="hint"></p><p id="dialog-error" role="alert"></p><div class="dialog-actions"><button id="cancel-remove" type="button">Cancel</button><button id="confirm-remove" type="submit" class="danger">Remove</button></div></form></dialog></body></html>`;
+}
+
+export function createServer({ configPath = path.join(root, 'apps.json'), statePath = path.join(path.dirname(configPath), `${path.basename(configPath, '.json')}.state.json`), reloadMs = 1000, shutdown = stopApp, onConfigError = () => console.error('Shortcut configuration unavailable; check the local configuration.') } = {}) {
   const stylesheet = fs.readFileSync(path.join(root, 'public/style.css'));
+  const javascript = fs.readFileSync(path.join(root, 'public/app.js'));
+  let state = loadState(statePath);
+  let busy = false;
   let config = loadConfig(configPath);
   let checkedAt = performance.now();
   let hadError = false;
-  const server = http.createServer({ maxHeaderSize: 8192, headersTimeout: 10000, requestTimeout: 15000, connectionsCheckingInterval: 1000 }, (req, res) => {
+  const server = http.createServer({ maxHeaderSize: 8192, headersTimeout: 10000, requestTimeout: 15000, connectionsCheckingInterval: 1000 }, async (req, res) => {
     const reply = (status, body = '', headers = {}) => {
       res.writeHead(status, { 'Content-Type': 'text/plain; charset=utf-8', ...headers });
       res.end(req.method === 'HEAD' ? undefined : body);
@@ -122,8 +217,8 @@ export function createServer({ configPath = path.join(root, 'apps.json'), reload
     res.setHeader('Referrer-Policy', 'no-referrer');
     res.setHeader('X-Frame-Options', 'DENY');
     res.setHeader('Cross-Origin-Resource-Policy', 'same-origin');
-    res.setHeader('Content-Security-Policy', "default-src 'none'; style-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'");
-    if (!['GET', 'HEAD'].includes(req.method)) return reply(405, 'Method not allowed', { Allow: 'GET, HEAD', Connection: 'close' });
+    res.setHeader('Content-Security-Policy', "default-src 'none'; style-src 'self'; script-src 'self'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'");
+    if (!['GET', 'HEAD', 'POST'].includes(req.method)) return reply(405, 'Method not allowed', { Allow: 'GET, HEAD, POST', Connection: 'close' });
     if (req.headers['transfer-encoding'] || (req.headers['content-length'] && req.headers['content-length'] !== '0')) {
       return reply(400, 'Request bodies are not supported', { Connection: 'close' });
     }
@@ -159,11 +254,59 @@ export function createServer({ configPath = path.join(root, 'apps.json'), reload
     }
     // A query cannot alter a configured redirect. Avoid URL path normalization.
     const pathname = req.url.split('?')[0];
-    if (pathname === '/') return reply(200, home(config.entries), { 'Content-Type': 'text/html; charset=utf-8' });
+    const action = /^\/api\/apps\/([a-zA-Z0-9_-]{1,80})\/(minimize|restore|remove|shutdown)$/.exec(pathname);
+    if (req.method === 'POST') {
+      if (!action || req.url !== pathname) return reply(405, 'Method not allowed', { Allow: 'GET, HEAD' });
+      // Custom header cannot be sent by a cross-origin form or fetch without a
+      // CORS preflight. No CORS permission is granted, even on HTTP tailnet URLs.
+      if (req.headers['x-mini-request'] !== '1' || req.headers['sec-fetch-site'] === 'cross-site') return reply(403, 'Management request blocked');
+      if (busy) return reply(409, 'Another change is in progress. Please try again.');
+      busy = true;
+      try {
+        config = loadConfig(configPath);
+        checkedAt = performance.now();
+        const [, slug, operation] = action;
+        const app = config.entries.get(slug);
+        const previous = Object.hasOwn(state, slug) ? state[slug] : undefined;
+        if (!app) return reply(404, 'App is no longer available. Reload the directory.');
+        if (operation === 'shutdown' && previous?.shutdown === 'stopped') return reply(200, 'Already shut down');
+        if (operation === 'shutdown' && !app.shutdown) return reply(409, 'Server shutdown has not been configured for this app.');
+        if (operation !== 'shutdown' && previous?.shutdown && previous.shutdown !== 'none') return reply(409, 'This app has a shutdown record. Restart it on the server before resetting its directory state.');
+        if (operation === 'minimize' && previous?.visibility === 'removed') return reply(409, 'Restore this app first.');
+        const update = value => {
+          const next = { ...state };
+          if (value) Object.defineProperty(next, slug, { value, enumerable: true, writable: true, configurable: true });
+          else delete next[slug];
+          saveState(statePath, next);
+          state = next;
+        };
+        if (operation === 'restore') update(null);
+        else {
+          const record = { name: app.name, visibility: operation === 'minimize' ? 'minimized' : 'removed', shutdown: operation === 'shutdown' ? 'pending' : 'none' };
+          // Save removal before stopping. A failed shutdown remains visible in
+          // the Removed section so it can be retried, including after restart.
+          update(record);
+          if (operation === 'shutdown') {
+            try { await shutdown(app); } catch {
+              update({ ...record, shutdown: 'failed' });
+              return reply(502, 'Removed from the directory, but shutdown could not be confirmed. Open Removed to retry.');
+            }
+            update({ ...record, shutdown: 'stopped' });
+          }
+        }
+        // Refresh discovery after an unpublish without undoing a completed action.
+        checkedAt = -Infinity;
+        return reply(200, 'Saved');
+      } catch {
+        return reply(503, 'Could not save this change. Reload the directory and try again.');
+      } finally { busy = false; }
+    }
+    if (pathname === '/') return reply(200, home(config.entries, state), { 'Content-Type': 'text/html; charset=utf-8' });
     if (pathname === '/style.css') return reply(200, stylesheet, { 'Content-Type': 'text/css; charset=utf-8' });
+    if (pathname === '/app.js') return reply(200, javascript, { 'Content-Type': 'text/javascript; charset=utf-8' });
     const match = /^\/([a-zA-Z0-9_-]{1,80})\/?$/.exec(pathname);
     const app = match && config.entries.get(match[1]);
-    if (app) return reply(302, '', { Location: app.url });
+    if (app && !(Object.hasOwn(state, app.slug) && state[app.slug].visibility === 'removed')) return reply(302, '', { Location: app.url });
     return reply(404, 'Unknown shortcut. Open the home page to see your apps.');
   });
   server.keepAliveTimeout = 5000;

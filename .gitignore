@@ -3,6 +3,9 @@ apps.json
 apps.*.json
 !apps.example.json
 *.local.json
+*.state.json
+*.state.json.*.tmp
+*.mini-shortcuts-archive/
 .env
 .env.*
 !.env.example

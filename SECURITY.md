@@ -2,11 +2,20 @@
 
 ## Intended deployment
 
-Mini Shortcuts listens only on `127.0.0.1` behind Tailscale Serve. It lists app metadata and sends fixed redirects; it cannot upload files, mutate app settings, proxy destination content, or execute commands over HTTP. Local administrators and local configuration writers are trusted. Its host allowlist is a browser/DNS-rebinding defense, not user authentication: a direct HTTP client can choose its Host header.
+Mini Shortcuts listens only on `127.0.0.1` behind Tailscale Serve. It lists app metadata, sends fixed redirects, and allows reachable clients to minimize, remove, and shut down configured apps. It cannot upload files or proxy destination content. Shutdown can run only the fixed LaunchAgent operations described below or archive a discovered Tailnow site; HTTP input cannot supply commands, service labels, filesystem paths, or process IDs. Local administrators and local configuration writers are trusted. Its host allowlist is a browser/DNS-rebinding defense, not user authentication: a direct HTTP client can choose its Host header.
 
-Use Tailscale access policy to decide which devices can reach the launcher. Every permitted client can see the entire app directory. A redirect does not grant access to the destination; each app must enforce its own access rules. Do not expose this unauthenticated directory using Funnel, a public reverse proxy, or router port forwarding.
+Use Tailscale access policy to decide which devices can reach the launcher. Every permitted client can see and manage the app directory, including shutting down configured apps. There is no separate read-only or admin role. A redirect does not grant access to the destination; each app must enforce its own access rules. Do not expose this unauthenticated directory using Funnel, a public reverse proxy, or router port forwarding.
 
 Short HTTP entry URLs use Tailscale's encrypted network transport, but are not browser HTTPS secure contexts. The application itself does not encrypt HTTP. Keep this entry route confined to Tailscale; app destinations use HTTPS. [Tailscale Serve documentation](https://tailscale.com/docs/features/tailscale-serve).
+
+## Management changes — 2026-10-06
+
+- Bodyless POST routes require `X-Mini-Request: 1`, the Host allowlist, matching Origin when present, and non-cross-site Fetch Metadata. Cross-origin requests cannot set the custom header without a preflight, which is denied. GET/HEAD do not mutate state. No CORS permissions are granted. The browser confirmation dialog is an accidental-action safeguard, not an authorization boundary.
+- External JavaScript is served with `script-src 'self'` and `connect-src 'self'`; inline code and framing remain blocked. App text and attributes are escaped. Metadata, paths, and command diagnostics are not returned in error responses.
+- Directory state is stored privately alongside the config using bounded JSON, mode 0600, and atomic replacement. Operations are serialized within a single process. Removal is saved before shutdown; failures retain a removed record and retry control. Keep one process per state file. Startup fails closed if existing state is invalid.
+- Standalone service shutdown uses `execFile` without a shell and fixed `/bin/launchctl` operations. Service labels come only from validated, trusted local configuration; the GUI user ID comes from the process. Commands have timeouts and bounded output. Disable prevents automatic restarts, bootout unloads the job, and print verifies absence. An error can leave the service disabled or stopped without confirmed completion; retry verifies the state. Local administrators must configure the correct dedicated service.
+- Tailnow shutdown renames only the selected discovered directory into a sibling archive outside the served root. Site and archive symlinks are rejected. Files are retained and shared hosting remains running. Local filesystem/configuration writers are trusted; archive paths must not be exposed by another server. An in-flight response or cached copy may remain available. If a crash occurs after archiving but before the final state write, verify the archive and repair the pending record locally.
+- Existing redirects, host/origin protections, startup privacy, persistence, failure handling, concurrency, configured service targets, and Tailnow isolation are covered by regression tests. The historical review below describes the earlier read-only version, not the current management surface.
 
 ## Pre-publication review — 2026-10-05
 
@@ -20,7 +29,7 @@ Scope: the original standalone launcher, configuration handling, generated HTML,
 | Inline styles required a broader Content Security Policy | Defense-in-depth weakness, not a demonstrated script injection; app text was already escaped | Local stylesheet and CSP without `unsafe-inline`; escaping retained and tested |
 | Installed configuration and operating notes contained deployment identifiers and absolute personal paths | Disclosure if copied into public Git history | Fresh sanitized repository; examples only; local configuration, backups, logs, and installed plists excluded |
 
-Existing safeguards retained: loopback-only production listener, GET/HEAD-only routes, escaped app text, fixed configured destinations, no forwarded query parameters, and no third-party runtime dependencies. The review found no server-side fetching/SSRF path or remote file-write/code-execution feature in the reviewed code.
+Safeguards at the time of this review: loopback-only production listener, GET/HEAD-only routes, escaped app text, fixed configured destinations, no forwarded query parameters, and no third-party runtime dependencies. The review found no server-side fetching/SSRF path or remote file-write/code-execution feature in the reviewed code.
 
 Regression tests cover HTML escaping, security headers, unknown/duplicate Host values, cross-origin requests, open-redirect attempts, traversal and source/configuration exposure, method/body restrictions, oversized requests, URL and configuration validation, symlink discovery, invalid reload recovery, and caching. Node's built-in HTTP protections are configured explicitly; see [Node HTTP documentation](https://nodejs.org/api/http.html).
 

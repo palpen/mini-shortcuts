@@ -59,11 +59,41 @@ See [Tailscale Serve](https://tailscale.com/docs/features/tailscale-serve) and [
 - Destinations must use HTTPS without embedded usernames or passwords. The local configuration is trusted: only add destinations you intend to visit. The service does not fetch or verify their content.
 - Configuration and directory changes appear on the first request after the one-second cache expires. An invalid reload returns a generic 503 until repaired; it does not continue serving stale entries.
 - Limits: 128 KiB configuration, 500 apps, and 2,000 entries scanned in the Tailnow directory. App names are at most 120 characters and descriptions at most 300.
-- Each `/app-name` or `/app-name/` redirects to its fixed destination. Request query parameters are discarded. There is no management or file-serving API.
+- Each `/app-name` or `/app-name/` redirects to its fixed destination. Request query parameters are discarded. Removed entries return 404. There is no destination file-serving API.
+
+## Organize and remove apps
+
+Each card has **Minimize** and **Remove…** controls:
+
+- **Minimize** moves the app into a collapsed section below your main cards. The app keeps running and its shortcut keeps working. **Restore** brings it back to the top.
+- **Remove…** opens a confirmation dialog. By default it removes only the directory entry and disables its short redirect. The destination app stays available at its original URL. Open **Removed** to restore the shortcut or shut down the app later.
+- Select **Also shut down on the server** to remove the shortcut and stop the selected app. A failed shutdown remains in **Removed**, with a retry control. No app files are deleted.
+
+Layout and removal records are saved across browsers, devices, and server restarts in `apps.state.json` next to `apps.json` (or `<config-name>.state.json` for a custom `MINI_CONFIG`). Keep this private file and its directory writable by the service account. Writes use atomic replacement with mode `0600`; a failed removal write prevents shutdown. Run only one launcher process per state file. Changes to the state file by a local administrator take effect after a launcher restart. A corrupt state file prevents startup rather than silently restoring removed apps.
+
+Tailnow sites can be shut down automatically: the selected site's directory moves to a sibling archive named `<sites-directory>.mini-shortcuts-archive/<slug>-<unique-id>`, outside the served directory. Other sites and the shared Tailnow server keep running. This unpublishes future requests; it does not revoke copies already downloaded by clients. Do not serve or auto-discover the archive directory. Republishing a removed slug does not automatically restore its shortcut.
+
+For a standalone macOS app, configure its exact user LaunchAgent label in the trusted local app entry:
+
+```json
+{
+  "slug": "pigeon",
+  "name": "Pigeon",
+  "description": "Files, notes, and reports",
+  "url": "https://mini.example-tailnet.ts.net:8443/",
+  "service": { "type": "launchAgent", "label": "com.example.pigeon" }
+}
+```
+
+Shutdown runs `launchctl disable` and `bootout` for that label in the launcher's own GUI user domain, then verifies it is unloaded. Disabling prevents KeepAlive and login from restarting it. Configure only the dedicated app's service, never the launcher itself or a shared service. Unconfigured entries still support minimize/remove; arbitrary processes, remote servers, and system daemons cannot be stopped. LaunchAgent shutdown requires macOS.
+
+To bring a stopped service back, run `launchctl enable gui/<uid>/<label>` and `launchctl bootstrap gui/<uid> /absolute/path/to/agent.plist` on the server. For a stopped Tailnow site, move its archived folder back to `<sites-directory>/<slug>`, or republish it. Then, with the launcher stopped, remove that slug's record from `apps.state.json` and start the launcher again. A shutdown record is deliberately retained until you restore the service and reset its directory state.
+
+Management uses bodyless `POST /api/apps/<slug>/{minimize,restore,remove,shutdown}` requests with `X-Mini-Request: 1`. GET/HEAD never mutate state. Host/origin checks apply and cross-site writes are blocked. Like directory access, management is available to every client permitted by your Tailscale policy; there is no separate admin role. See [SECURITY.md](SECURITY.md).
 
 ## Start at login on macOS
 
-Copy `deploy/com.example.mini-shortcuts.plist.example` to `~/Library/LaunchAgents/com.example.mini-shortcuts.plist`. Replace the absolute application, Node executable, and log paths. Keep the service in a stable directory; `server.mjs`, `public/style.css`, and your private `apps.json` must stay together. Create the log directory before loading the agent.
+Copy `deploy/com.example.mini-shortcuts.plist.example` to `~/Library/LaunchAgents/com.example.mini-shortcuts.plist`. Replace the absolute application, Node executable, and log paths. Keep the service in a stable directory; `server.mjs`, the `public/` directory, and your private `apps.json` must stay together. Create the log directory before loading the agent.
 
 On Apple Silicon Macs using Homebrew, install `node@24` and use `/opt/homebrew/opt/node@24/bin/node` as the agent's executable. This selects Node 24 specifically for the service. Update it periodically with `brew upgrade node@24` and restart the agent to load the updated runtime.
 
