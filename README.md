@@ -1,4 +1,11 @@
-# Mini Shortcuts
+# Mini Shortcuts — deprecated
+
+> [!IMPORTANT]
+> Mini Shortcuts has been merged into [TailNow](https://github.com/palpen/tailnow). Use TailNow for the app directory, publishing, and app management. This standalone project is deprecated and no longer maintained.
+>
+> See [TailNow's migration guide](https://github.com/palpen/tailnow#migrating-mini-shortcuts) to move your app configuration and saved directory layout. This repository is retained as a read-only historical reference.
+
+The documentation below describes the final standalone version.
 
 A small, self-hosted app directory for a Tailscale network. Open `http://mini/` to see your apps, or type `http://mini/pigeon` to jump to an app's HTTPS address. The address bar changes to the destination URL.
 
